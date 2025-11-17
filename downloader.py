@@ -156,7 +156,9 @@ def download_google_drive(url: str, out_dir: Path) -> None:
             url=url,
             output=str(out_dir),
             quiet=False,
-            use_cookies=False
+            use_cookies=False,
+            remaining_ok=True,   
+            resume=False          # optional, skips already-downloaded files
         )
     else:
         # File
