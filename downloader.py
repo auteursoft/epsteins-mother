@@ -145,17 +145,29 @@ def log_failed_google_download(from_url: str | None, to_path: Path | None, reaso
     url_str = from_url or "UNKNOWN_URL"
     path_str = str(to_path) if to_path is not None else "UNKNOWN_PATH"
     line = f"{url_str}\t{path_str}\t{reason}\n"
-    FAILED_LOG.parent.mkdir(parents=True, exist_ok=True)  # usually just "."
+    FAILED_LOG.parent.mkdir(parents=True, exist_ok=True)
     with FAILED_LOG.open("a", encoding="utf-8") as f:
         f.write(line)
 
 
-def download_file_direct(from_url: str, to_path: Path) -> None:
-    """
-    Fallback: download a Google Drive 'uc?id=...' URL directly with requests.
+def guess_extension_from_content_type(content_type: str) -> str:
+    ct = content_type.lower()
+    if "image/jpeg" in ct:
+        return ".jpg"   # works fine for .jpeg as well
+    if "image/png" in ct:
+        return ".png"
+    if "image/gif" in ct:
+        return ".gif"
+    if "application/pdf" in ct:
+        return ".pdf"
+    if "text/plain" in ct:
+        return ".txt"
+    # default: unknown
+    return ""
 
-    This works for files that are actually public and for which Drive returns
-    the binary content directly (e.g., many images).
+def download_file_direct_to_path(from_url: str, to_path: Path) -> None:
+    """
+    Fallback: download a Google Drive 'uc?id=...' URL directly to an explicit path.
     """
     to_path = Path(to_path)
     to_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,18 +185,74 @@ def download_file_direct(from_url: str, to_path: Path) -> None:
         r.raise_for_status()
         content_type = r.headers.get("Content-Type", "").lower()
 
-        # If it's clearly HTML, we *might* be hitting a quota/blocked page.
         if "text/html" in content_type:
-            reason = f"Fallback returned HTML (Content-Type={content_type})"
+            # Probably a quota or interstitial page; still save it, but log
+            reason = f"HTML response (Content-Type={content_type}) when writing to {to_path}"
             print("[fallback] WARNING:", reason)
             log_failed_google_download(direct_url, to_path, reason)
-        else:
-            print(f"[fallback] -> {to_path}")
 
+        print(f"[fallback] -> {to_path}")
         with open(to_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
+
+
+def download_file_direct_guess_name(from_url: str, out_dir: Path) -> Path:
+    """
+    Fallback when we *don't* know the intended filename/path.
+    We:
+      - GET the URL
+      - try Content-Disposition filename
+      - else use the id=... + extension guessed from Content-Type
+      - save under out_dir / 'gdrive_fallback' / filename
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    parsed = urlparse.urlparse(from_url)
+    query = dict(urlparse.parse_qsl(parsed.query))
+    file_id = query.get("id", "unknown_id")
+
+    query.setdefault("export", "download")
+    direct_url = urlparse.urlunparse(
+        parsed._replace(query=urlparse.urlencode(query))
+    )
+
+    print(f"[fallback] Direct GET (guess name) for {direct_url}")
+    with requests.get(direct_url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "").lower()
+        cd = r.headers.get("Content-Disposition", "")
+
+        # Try to extract filename from Content-Disposition
+        filename = None
+        m = re.search(r'filename\*?="?([^";]+)"?', cd)
+        if m:
+            filename = m.group(1)
+
+        if not filename:
+            # Use id + extension guessed from content-type
+            ext = guess_extension_from_content_type(content_type)
+            filename = file_id + ext
+
+        fallback_dir = out_dir / "gdrive_fallback"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        to_path = fallback_dir / filename
+
+        if "text/html" in content_type:
+            reason = f"HTML response (Content-Type={content_type}) when guessing name {to_path}"
+            print("[fallback] WARNING:", reason)
+            log_failed_google_download(direct_url, to_path, reason)
+
+        print(f"[fallback] -> {to_path}")
+        with open(to_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+    return to_path
+
 
 def download_google_drive(url: str, out_dir: Path) -> None:
     """
@@ -193,7 +261,7 @@ def download_google_drive(url: str, out_dir: Path) -> None:
     - If it's a folder, gdown will recreate the folder structure under out_dir.
     - If it's a single file, it will save into out_dir.
     - If gdown hits FileURLRetrievalError for some files, we attempt a direct
-      fallback download using the 'From:' and 'To:' info in the error message.
+      fallback download.
     - Any files we still can't grab are logged to failed_downloads_google.txt.
     """
     if gdown is None:
@@ -225,6 +293,53 @@ def download_google_drive(url: str, out_dir: Path) -> None:
                 quiet=False,
                 fuzzy=True,
             )
+
+    except FolderContentsMaximumLimitError as e:
+        print(f"[gdrive] Folder limit error from gdown: {e}")
+        print("[gdrive] Try upgrading gdown: pip install --upgrade gdown")
+        log_failed_google_download(url, out_dir, f"FolderContentsMaximumLimitError: {e}")
+
+    except FileURLRetrievalError as e:
+        msg = str(e)
+        print("[gdrive] FileURLRetrievalError encountered, trying fallback.")
+        print(msg.strip())
+
+        # 1. First try the older-style "From:" / "To:" lines, if present
+        from_match = re.search(r"From:\s*(https?://[^\s]+)", msg)
+        to_match = re.search(r"To:\s*([^\n]+)", msg)
+
+        if from_match and to_match:
+            from_url = from_match.group(1).strip()
+            to_path = Path(to_match.group(1).strip())
+            try:
+                download_file_direct_to_path(from_url, to_path)
+                print("[gdrive] Fallback direct download (explicit path) finished.")
+            except Exception as inner_e:
+                reason = f"Fallback direct download exception: {inner_e}"
+                print(f"[gdrive] Fallback direct download FAILED: {inner_e}")
+                log_failed_google_download(from_url, to_path, reason)
+            return
+
+        # 2. Otherwise, parse the "You may still be able to access the file" URL
+        browser_url_match = re.search(
+            r"https?://drive\.google\.com/uc\?[^ \n]+", msg
+        )
+
+        if browser_url_match:
+            from_url = browser_url_match.group(0).strip()
+            try:
+                written_path = download_file_direct_guess_name(from_url, out_dir)
+                print(f"[gdrive] Fallback direct download (guessed name) finished: {written_path}")
+            except Exception as inner_e:
+                reason = f"Fallback direct (guess name) exception: {inner_e}"
+                print(f"[gdrive] Fallback direct (guess name) FAILED: {inner_e}")
+                log_failed_google_download(from_url, None, reason)
+        else:
+            reason = "Could not parse any uc?id=... URL from FileURLRetrievalError"
+            print("[gdrive] " + reason)
+            log_failed_google_download(None, None, reason)
+
+        return
 
     except FolderContentsMaximumLimitError as e:
         print(f"[gdrive] Folder limit error from gdown: {e}")
