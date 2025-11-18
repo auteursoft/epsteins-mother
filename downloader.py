@@ -313,65 +313,83 @@ def download_google_drive(url: str, out_dir: Path) -> None:
     seen_bad_ids: set[str] = set()
 
     # Folder case: single gdown call with one-shot fallback on error
-    try:
-        gdown.download_folder(
-            url=url,
-            output=str(out_dir),
-            quiet=False,
-            use_cookies=False,
-            remaining_ok=True,
-            resume=True,
-        )
-        print("[gdrive] Folder download completed with gdown.")
+    # Folder case: retry a few times on JSONDecodeError; one-shot fallback on FileURLRetrievalError
+    max_retries = 3
 
-    except FolderContentsMaximumLimitError as e:
-        print(f"[gdrive] Folder limit error from gdown: {e}")
-        print("[gdrive] Try upgrading gdown: pip install --upgrade gdown")
-        log_failed_google_download(url, out_dir, f"FolderContentsMaximumLimitError: {e}")
-
-    except FileURLRetrievalError as e:
-        msg = str(e)
-        print("[gdrive] FileURLRetrievalError encountered during folder download, trying fallback.")
-        print(msg.strip())
-
-        # Try to extract uc?id=... URL from the message
-        browser_url_match = re.search(
-            r"https?://drive\.google\.com/uc\?[^ \n]+", msg
-        )
-        if not browser_url_match:
-            reason = "Could not parse uc?id=... URL from FileURLRetrievalError"
-            print("[gdrive] " + reason)
-            log_failed_google_download(None, None, reason)
-            return
-
-        from_url = browser_url_match.group(0).strip()
-
-        # Try to grab more precise "To:" path if gdown reported it (older-style messages)
-        to_match = re.search(r"To:\s*([^\n]+)", msg)
+    for attempt in range(1, max_retries + 1):
         try:
-            if to_match:
-                to_path = Path(to_match.group(1).strip())
-                download_file_direct_to_path(from_url, to_path)
-                print(f"[gdrive] Fallback direct download (explicit path) finished: {to_path}")
+            print(f"[gdrive] Folder download attempt {attempt}/{max_retries}")
+            gdown.download_folder(
+                url=url,
+                output=str(out_dir),
+                quiet=False,
+                use_cookies=False,
+                remaining_ok=True,
+                resume=True,
+            )
+            print("[gdrive] Folder download completed with gdown.")
+            return  # success, we're done with this folder
+
+        except FolderContentsMaximumLimitError as e:
+            print(f"[gdrive] Folder limit error from gdown: {e}")
+            print("[gdrive] Try upgrading gdown: pip install --upgrade gdown")
+            log_failed_google_download(url, out_dir, f"FolderContentsMaximumLimitError: {e}")
+            return  # can't do much more automatically
+
+        except FileURLRetrievalError as e:
+            msg = str(e)
+            print("[gdrive] FileURLRetrievalError encountered during folder download, trying fallback.")
+            print(msg.strip())
+
+            # Try to extract uc?id=... URL from the message
+            browser_url_match = re.search(
+                r"https?://drive\.google\.com/uc\?[^ \n]+", msg
+            )
+            if not browser_url_match:
+                reason = "Could not parse uc?id=... URL from FileURLRetrievalError"
+                print("[gdrive] " + reason)
+                log_failed_google_download(None, None, reason)
+                return
+
+            from_url = browser_url_match.group(0).strip()
+
+            # Try to grab more precise "To:" path if gdown reported it (older-style messages)
+            to_match = re.search(r"To:\s*([^\n]+)", msg)
+            try:
+                if to_match:
+                    to_path = Path(to_match.group(1).strip())
+                    download_file_direct_to_path(from_url, to_path)
+                    print(f"[gdrive] Fallback direct download (explicit path) finished: {to_path}")
+                else:
+                    written_path = download_file_direct_guess_name(from_url, out_dir)
+                    print(f"[gdrive] Fallback direct download (guessed name) finished: {written_path}")
+                # After fallback, we don't re-run gdown for this folder; it will just fail on the same item.
+                print("[gdrive] Stopping after fallback; some later files in this folder may not be downloaded by gdown.")
+            except Exception as inner_e:
+                reason = f"Fallback direct download exception: {inner_e}"
+                print(f"[gdrive] Fallback direct download FAILED: {inner_e}")
+                log_failed_google_download(from_url, None, reason)
+
+            return  # we're done with this folder, successful or not
+
+        except json.JSONDecodeError as e:
+            # gdown expected JSON from Google but got empty/HTML/etc.
+            reason = f"JSONDecodeError in gdown.download_folder: {e}"
+            print("[gdrive] " + reason)
+            if attempt == max_retries:
+                # After several tries, give up on this folder
+                log_failed_google_download(url, out_dir, reason)
+                return
             else:
-                written_path = download_file_direct_guess_name(from_url, out_dir)
-                print(f"[gdrive] Fallback direct download (guessed name) finished: {written_path}")
-            # After fallback, we *don’t* re-run gdown; we stop here.
-            print("[gdrive] Stopping after fallback; some later files in this folder may not be downloaded by gdown.")
-        except Exception as inner_e:
-            reason = f"Fallback direct download exception: {inner_e}"
-            print(f"[gdrive] Fallback direct download FAILED: {inner_e}")
-            log_failed_google_download(from_url, None, reason)
+                print("[gdrive] Retrying after JSONDecodeError...")
+                continue  # try gdown.download_folder again
 
-    except json.JSONDecodeError as e:
-        reason = f"JSONDecodeError in gdown.download_folder: {e}"
-        print("[gdrive] " + reason)
-        log_failed_google_download(url, out_dir, reason)
-
-    except Exception as e:
-        reason = f"Unexpected error in gdown.download_folder: {e}"
-        print("[gdrive] " + reason)
-        log_failed_google_download(url, out_dir, reason)
+        except Exception as e:
+            # Catch-all for any other unexpected gdown internals
+            reason = f"Unexpected error in gdown.download_folder: {e}"
+            print("[gdrive] " + reason)
+            log_failed_google_download(url, out_dir, reason)
+            return
 
 
 def find_links_on_page(page_url: str):
