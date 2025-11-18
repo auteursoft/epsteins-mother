@@ -5,3 +5,10 @@ Files made available for download here, in a Google Drive: https://drive.google.
 
 The drive is referenced here: https://oversight.house.gov/release/oversight-committee-releases-additional-epstein-estate-documents/ 
 
+## Getting Files
+1. Do the usual work to create your python virtual environment: 
+ - `python3 -m venv .venv`
+ - `source .venv/bin/activate`
+ - `pip install -r requirements.txt`
+2. Run the downloader: `python downloader.py`
+
