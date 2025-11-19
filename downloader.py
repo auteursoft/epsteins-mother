@@ -285,6 +285,7 @@ def download_google_drive(url: str, out_dir: Path) -> None:
                 output=str(out_dir),
                 quiet=False,
                 fuzzy=True,
+                use_cookies=True, 
             )
         except FileURLRetrievalError as e:
             msg = str(e)
@@ -323,7 +324,7 @@ def download_google_drive(url: str, out_dir: Path) -> None:
                 url=url,
                 output=str(out_dir),
                 quiet=False,
-                use_cookies=False,
+                use_cookies=True,   # <--- was False before
                 remaining_ok=True,
                 resume=True,
             )
