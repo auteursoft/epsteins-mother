@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
 """
-downloader.py  (v2 – resilient Google Drive folder downloads)
+downloader.py  (v3 – full folder enumeration via Drive API v3)
 
 Usage:
     python downloader.py <url>
+    python downloader.py --setup-key           # interactive API key setup
 
-Improvements over v1:
-  - Auto-extracts Firefox (or Chrome) cookies for drive.google.com
-  - Enumerates Google Drive folder contents by scraping the folder page
+    # Override API key via env var:
+    GDRIVE_API_KEY=AIza... python downloader.py <url>
+
+Improvements over v2:
+  - Uses Google Drive API v3 files.list with pagination (pageSize=1000)
+    to enumerate ALL files in a folder, not just the first ~50
+  - Recursively walks subfolders, preserving directory structure
+  - Auto-extracts Firefox/Chrome cookies for drive.google.com
   - Downloads each file individually with retries + exponential backoff
-  - One file's failure never stops the rest of the folder
+  - One file's failure never stops the rest
+  - Tracks progress and prints a summary at the end
+
+Requirements:
+    pip install requests beautifulsoup4 gdown browser-cookie3
+
+    You also need a free Google API key with Drive API enabled.
+    See: https://console.cloud.google.com/apis/credentials
 """
 
 import sys
@@ -39,6 +52,86 @@ except ImportError:
 
 FAILED_LOG = Path("failed_downloads_google.txt")
 GDOWN_COOKIE_PATH = Path.home() / ".cache" / "gdown" / "cookies.txt"
+API_KEY_PATH = Path.home() / ".config" / "gdrive_downloader" / "api_key.txt"
+
+# ── API key management ────────────────────────────────────────────────
+
+def load_api_key() -> Optional[str]:
+    """
+    Load Google API key from (in priority order):
+      1. GDRIVE_API_KEY environment variable
+      2. ~/.config/gdrive_downloader/api_key.txt
+    """
+    key = os.environ.get("GDRIVE_API_KEY", "").strip()
+    if key:
+        return key
+
+    if API_KEY_PATH.exists():
+        key = API_KEY_PATH.read_text().strip()
+        if key:
+            return key
+
+    return None
+
+
+def save_api_key(key: str) -> None:
+    """Save API key to ~/.config/gdrive_downloader/api_key.txt"""
+    API_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    API_KEY_PATH.write_text(key.strip() + "\n")
+    API_KEY_PATH.chmod(0o600)
+    print(f"[setup] API key saved to {API_KEY_PATH}")
+
+
+def setup_key_interactive() -> None:
+    """Interactive API key setup."""
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║           Google Drive API Key Setup                        ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  1. Go to https://console.cloud.google.com                   ║
+║  2. Create a project (or pick an existing one)               ║
+║  3. Go to "APIs & Services" > "Enabled APIs"                 ║
+║     → Enable "Google Drive API"                              ║
+║  4. Go to "APIs & Services" > "Credentials"                  ║
+║     → Create Credentials > API Key                           ║
+║  5. Copy the key and paste it below                          ║
+║                                                              ║
+║  This key is free and allows listing public folder contents. ║
+║  No OAuth or consent screen needed.                          ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+""")
+    key = input("Paste your API key: ").strip()
+    if not key:
+        print("No key entered, aborting.")
+        sys.exit(1)
+
+    # Quick validation
+    test_url = f"https://www.googleapis.com/drive/v3/files?pageSize=1&key={key}"
+    try:
+        r = requests.get(test_url, timeout=10)
+        if r.status_code == 200:
+            print("[setup] API key is valid!")
+        elif r.status_code == 403:
+            data = r.json()
+            msg = data.get("error", {}).get("message", "")
+            if "not enabled" in msg.lower():
+                print("[setup] WARNING: Key works but Google Drive API is not enabled.")
+                print("        Go to APIs & Services > Enable 'Google Drive API'")
+            else:
+                print(f"[setup] WARNING: Got 403 – {msg}")
+                print("        The key may still work for public files.")
+        elif r.status_code == 400:
+            print("[setup] WARNING: Key format may be invalid.")
+        else:
+            print(f"[setup] Got status {r.status_code} – saving anyway.")
+    except Exception as e:
+        print(f"[setup] Could not validate key ({e}) – saving anyway.")
+
+    save_api_key(key)
+    print("\nYou can now run: python downloader.py <google_drive_folder_url>")
+
 
 # ── Cookie helpers ────────────────────────────────────────────────────
 
@@ -58,10 +151,7 @@ def _export_netscape_cookies(cj: http.cookiejar.CookieJar, path: Path) -> int:
 
 
 def extract_browser_cookies(domain: str = ".google.com") -> Optional[http.cookiejar.CookieJar]:
-    """
-    Try to pull cookies from Firefox, then Chrome, for the given domain.
-    Returns a CookieJar or None.
-    """
+    """Try to pull cookies from Firefox, then Chrome."""
     if browser_cookie3 is None:
         print("[cookies] browser_cookie3 not installed – pip install browser-cookie3")
         return None
@@ -72,7 +162,6 @@ def extract_browser_cookies(domain: str = ".google.com") -> Optional[http.cookie
     ]:
         try:
             cj = loader(domain_name=domain)
-            # Quick sanity: does it have any cookies?
             if sum(1 for _ in cj) > 0:
                 print(f"[cookies] Loaded cookies from {browser_name} for {domain}")
                 return cj
@@ -84,21 +173,16 @@ def extract_browser_cookies(domain: str = ".google.com") -> Optional[http.cookie
 
 
 def setup_cookies() -> Optional[http.cookiejar.CookieJar]:
-    """
-    Extract browser cookies and:
-      1. Write them to ~/.cache/gdown/cookies.txt  (so gdown picks them up)
-      2. Return the CookieJar for use with requests
-    """
+    """Extract browser cookies and write to gdown's expected path."""
     cj = extract_browser_cookies()
     if cj is None:
         return None
-
     n = _export_netscape_cookies(cj, GDOWN_COOKIE_PATH)
     print(f"[cookies] Wrote {n} cookies to {GDOWN_COOKIE_PATH}")
     return cj
 
 
-# ── Common helpers (unchanged from v1) ────────────────────────────────
+# ── Common helpers ────────────────────────────────────────────────────
 
 def ensure_data_dir() -> Path:
     data_dir = Path("data")
@@ -129,8 +213,7 @@ def get_session(cookie_jar=None) -> requests.Session:
 
 
 def safe_filename_from_url(url: str, fallback: str = "download") -> str:
-    parsed = urlparse.urlparse(url)
-    name = os.path.basename(parsed.path.rstrip("/"))
+    name = os.path.basename(urlparse.urlparse(url).path.rstrip("/"))
     return name or fallback
 
 
@@ -154,95 +237,200 @@ def guess_extension_from_content_type(ct: str) -> str:
     return ""
 
 
-# ── Google Drive folder enumeration ──────────────────────────────────
+def _write_stream(response: requests.Response, path: Path) -> None:
+    with open(path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
 
-def extract_folder_id(url: str) -> Optional[str]:
-    """Pull the folder ID out of a Google Drive folder URL."""
-    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
+
+def _extract_confirm_token(html: str) -> Optional[str]:
+    m = re.search(r'confirm=([a-zA-Z0-9_-]+)', html)
     return m.group(1) if m else None
 
 
-def enumerate_folder_files(folder_url: str, session: requests.Session) -> list[dict]:
+# ══════════════════════════════════════════════════════════════════════
+# Google Drive API v3 folder enumeration (the key improvement)
+# ══════════════════════════════════════════════════════════════════════
+
+def extract_folder_id(url: str) -> Optional[str]:
+    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', url)
+    return m.group(1) if m else None
+
+
+def list_folder_files_api(
+    folder_id: str,
+    api_key: str,
+    session: requests.Session,
+) -> list[dict]:
     """
-    Scrape a public Google Drive folder page to get a list of
-    {id, name} dicts for every file. Works without an API key by
-    parsing the JS data blob Google embeds in the HTML.
+    Use Google Drive API v3 files.list to enumerate ALL files in a single
+    folder. Handles pagination via nextPageToken. Returns list of dicts:
+        [{"id": "...", "name": "...", "mimeType": "..."}, ...]
+    """
+    endpoint = "https://www.googleapis.com/drive/v3/files"
+    # q = '<folder_id>' in parents AND not trashed
+    query = f"'{folder_id}' in parents and trashed = false"
+    fields = "nextPageToken, files(id, name, mimeType, size)"
+
+    all_files = []
+    page_token = None
+    page_num = 0
+
+    while True:
+        page_num += 1
+        params = {
+            "q": query,
+            "key": api_key,
+            "pageSize": 1000,        # max allowed by the API
+            "fields": fields,
+            "orderBy": "name",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        r = session.get(endpoint, params=params, timeout=30)
+
+        if r.status_code == 403:
+            error_msg = r.json().get("error", {}).get("message", "")
+            if "not enabled" in error_msg.lower():
+                print("[api] ERROR: Google Drive API is not enabled for your project.")
+                print("      Go to https://console.cloud.google.com/apis/library/drive.googleapis.com")
+                print("      and click ENABLE.")
+            elif "api key" in error_msg.lower():
+                print(f"[api] ERROR: API key issue – {error_msg}")
+            else:
+                print(f"[api] ERROR 403: {error_msg}")
+            return []
+
+        if r.status_code == 404:
+            print(f"[api] Folder {folder_id} not found or not public.")
+            return []
+
+        if r.status_code != 200:
+            print(f"[api] Unexpected status {r.status_code}: {r.text[:300]}")
+            return []
+
+        data = r.json()
+        files = data.get("files", [])
+        all_files.extend(files)
+
+        if page_num % 5 == 0 or not data.get("nextPageToken"):
+            print(f"[api] Page {page_num}: {len(files)} items (total so far: {len(all_files)})")
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return all_files
+
+
+def enumerate_folder_recursive(
+    folder_id: str,
+    api_key: str,
+    session: requests.Session,
+    path_prefix: str = "",
+    depth: int = 0,
+    max_depth: int = 20,
+) -> list[dict]:
+    """
+    Recursively enumerate all files in a Google Drive folder tree.
+    Returns a flat list of:
+        [{"id": "...", "name": "...", "rel_path": "subfolder/file.jpg"}, ...]
     
-    Falls back to gdown's internal listing if scraping fails.
+    Subfolders are identified by mimeType == "application/vnd.google-apps.folder".
+    """
+    if depth > max_depth:
+        print(f"[api] Max depth {max_depth} reached at {path_prefix}, stopping recursion.")
+        return []
+
+    indent = "  " * depth
+    items = list_folder_files_api(folder_id, api_key, session)
+
+    if not items:
+        return []
+
+    result = []
+    subfolders = []
+
+    for item in items:
+        name = item["name"]
+        mime = item.get("mimeType", "")
+        rel = os.path.join(path_prefix, name) if path_prefix else name
+
+        if mime == "application/vnd.google-apps.folder":
+            subfolders.append((item["id"], name, rel))
+        else:
+            result.append({
+                "id": item["id"],
+                "name": name,
+                "rel_path": rel,
+                "mimeType": mime,
+                "size": item.get("size"),
+            })
+
+    file_count = len(result)
+    folder_count = len(subfolders)
+    label = path_prefix or "(root)"
+    print(f"{indent}[api] {label}: {file_count} files, {folder_count} subfolders")
+
+    # Recurse into subfolders
+    for sf_id, sf_name, sf_path in subfolders:
+        sub_files = enumerate_folder_recursive(
+            sf_id, api_key, session,
+            path_prefix=sf_path,
+            depth=depth + 1,
+            max_depth=max_depth,
+        )
+        result.extend(sub_files)
+
+    return result
+
+
+# ── Fallback: HTML scrape for when there's no API key ────────────────
+
+def enumerate_folder_html_scrape(
+    folder_url: str, session: requests.Session
+) -> list[dict]:
+    """
+    Scrape the Google Drive folder HTML page. Only gets the first ~50 files.
+    Used as a last-resort fallback when no API key is available.
     """
     folder_id = extract_folder_id(folder_url)
     if not folder_id:
         return []
 
-    files = []
-
-    # Strategy 1: Use the undocumented but stable JSON endpoint that
-    # Google's folder viewer hits. This returns file metadata as JSON.
-    # The "export" link works like:
-    #   https://drive.google.com/drive/folders/<id>  (the HTML page)
-    # The HTML embeds a big JS array we can parse.
     try:
         page_url = f"https://drive.google.com/drive/folders/{folder_id}"
-        print(f"[enum] Fetching folder page: {page_url}")
+        print(f"[scrape] Fetching folder page: {page_url}")
         r = session.get(page_url, timeout=60)
         r.raise_for_status()
-        html = r.text
 
-        # Google embeds file data in a JS variable. The pattern looks like:
-        #   window['_DRIVE_ivd'] = '...escaped JSON...';
-        # But more reliably, each file appears as an array element with
-        # the pattern: ["<file_id>","<filename>", ...
-        # We look for all file-ID-sized strings followed by filenames.
-        # 
-        # More robust: find all entries that look like
-        #   ["1D6O3V4HB_M19Czv4Ngv6LYZV1tWRPfb7","HOUSE_OVERSIGHT_018484.jpg"
         pattern = re.compile(
             r'\["(1[a-zA-Z0-9_-]{10,})"\s*,\s*"([^"]+\.[a-zA-Z0-9]{1,10})"'
         )
-        for match in pattern.finditer(html):
-            fid, fname = match.group(1), match.group(2)
-            files.append({"id": fid, "name": fname})
-
-        # Deduplicate by ID
         seen = set()
-        deduped = []
-        for f in files:
-            if f["id"] not in seen:
-                seen.add(f["id"])
-                deduped.append(f)
-        files = deduped
+        files = []
+        for match in pattern.finditer(r.text):
+            fid, fname = match.group(1), match.group(2)
+            if fid not in seen:
+                seen.add(fid)
+                files.append({"id": fid, "name": fname, "rel_path": fname})
 
         if files:
-            print(f"[enum] Found {len(files)} files by scraping folder HTML")
-            return files
+            print(f"[scrape] Found {len(files)} files (may be incomplete for large folders)")
+        return files
 
     except Exception as e:
-        print(f"[enum] HTML scrape failed: {e}")
-
-    # Strategy 2: Use gdown's internal folder listing (it parses the
-    # same page but may fail on large folders)
-    if gdown is not None:
-        try:
-            print("[enum] Trying gdown._parse_google_drive_folder ...")
-            # gdown >= 5.x exposes this; exact API varies by version
-            from gdown.download_folder import _parse_google_drive_folder_url
-            return_code, gdrive_files = _parse_google_drive_folder_url(folder_url)
-            if gdrive_files:
-                files = [{"id": f.id, "name": f.name} for f in gdrive_files]
-                print(f"[enum] gdown listed {len(files)} files")
-                return files
-        except Exception as e:
-            print(f"[enum] gdown internal listing failed: {e}")
-
-    print("[enum] Could not enumerate folder contents.")
-    return []
+        print(f"[scrape] HTML scrape failed: {e}")
+        return []
 
 
 # ── Per-file Google Drive download with retries ──────────────────────
 
 def download_gdrive_file(
     file_id: str,
-    filename: str,
+    rel_path: str,
     out_dir: Path,
     session: requests.Session,
     max_retries: int = 4,
@@ -250,19 +438,14 @@ def download_gdrive_file(
 ) -> bool:
     """
     Download a single Google Drive file by ID, with exponential backoff.
-    
-    Tries three strategies in order:
-      1. gdown.download (benefits from cookies in ~/.cache/gdown/)
-      2. Direct GET to /uc?id=...&export=download&confirm=t  (with session cookies)
-      3. Confirm-token scrape for large files
-    
+    rel_path is the relative path (including subfolder structure) under out_dir.
     Returns True on success.
     """
-    out_path = out_dir / filename
+    out_path = out_dir / rel_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and out_path.stat().st_size > 0:
-        print(f"[skip] Already exists: {out_path}")
+        print(f"  [skip] Already exists: {out_path}")
         return True
 
     url = f"https://drive.google.com/uc?id={file_id}"
@@ -270,48 +453,46 @@ def download_gdrive_file(
     for attempt in range(1, max_retries + 1):
         delay = base_delay * (2 ** (attempt - 1))
 
-        # ── Try gdown first ──
+        # ── Strategy 1: gdown (attempts 1-2 only) ──
         if gdown is not None and attempt <= 2:
             try:
-                print(f"[gdrive] ({attempt}/{max_retries}) gdown: {filename}")
                 result = gdown.download(
                     url=url,
                     output=str(out_path),
-                    quiet=False,
+                    quiet=True,
                     fuzzy=False,
                     use_cookies=True,
                 )
                 if result and out_path.exists() and out_path.stat().st_size > 0:
                     return True
             except FileURLRetrievalError:
-                print(f"[gdrive] gdown FileURLRetrievalError on {filename}, will try direct GET")
-            except Exception as e:
-                print(f"[gdrive] gdown error on {filename}: {e}")
+                pass  # fall through to direct GET
+            except Exception:
+                pass
 
-        # ── Direct GET with cookies ──
+        # ── Strategy 2: direct GET with cookies + confirm token ──
         try:
             direct_url = f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t"
-            print(f"[gdrive] ({attempt}/{max_retries}) direct GET: {filename}")
             with session.get(direct_url, stream=True, timeout=300) as r:
                 ct = r.headers.get("Content-Type", "").lower()
 
-                # If we get an HTML page, it's the "virus scan" confirmation page
                 if "text/html" in ct and r.status_code == 200:
-                    # Try to extract the confirm token
                     confirm_token = _extract_confirm_token(r.text)
                     if confirm_token:
                         confirmed_url = f"{direct_url}&confirm={confirm_token}"
-                        print(f"[gdrive] Retrying with confirm token for {filename}")
                         with session.get(confirmed_url, stream=True, timeout=300) as r2:
                             r2.raise_for_status()
-                            ct2 = r2.headers.get("Content-Type", "").lower()
-                            if "text/html" not in ct2:
+                            if "text/html" not in r2.headers.get("Content-Type", "").lower():
                                 _write_stream(r2, out_path)
                                 return True
-                    # Still HTML – rate limited or permission denied
-                    print(f"[gdrive] Got HTML response for {filename}, backing off {delay:.0f}s")
-                    time.sleep(delay)
-                    continue
+
+                    # Still HTML → rate limited
+                    if attempt < max_retries:
+                        print(f"  [wait] Rate limited, backing off {delay:.0f}s ...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        break  # give up
 
                 r.raise_for_status()
                 _write_stream(r, out_path)
@@ -319,41 +500,19 @@ def download_gdrive_file(
 
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
-                print(f"[gdrive] Rate limited on {filename}, backing off {delay:.0f}s")
+                print(f"  [wait] 429 rate limit, backing off {delay:.0f}s ...")
                 time.sleep(delay)
                 continue
-            print(f"[gdrive] HTTP error on {filename}: {e}")
+            print(f"  [err] HTTP error: {e}")
         except Exception as e:
-            print(f"[gdrive] Error on {filename}: {e}")
+            print(f"  [err] {e}")
 
-        time.sleep(delay)
+        if attempt < max_retries:
+            time.sleep(delay)
 
-    # Exhausted retries
-    reason = f"All {max_retries} attempts failed for {filename}"
-    print(f"[gdrive] FAILED: {reason}")
+    reason = f"All {max_retries} attempts failed"
     log_failed_google_download(url, out_path, reason)
     return False
-
-
-def _extract_confirm_token(html: str) -> Optional[str]:
-    """Pull the download confirm token from a Google Drive warning page."""
-    # Pattern 1: form with confirm=...
-    m = re.search(r'confirm=([a-zA-Z0-9_-]+)', html)
-    if m:
-        return m.group(1)
-    # Pattern 2: /uc?...&confirm=...
-    m = re.search(r'id="download-form".*?confirm=([^&"]+)', html, re.DOTALL)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _write_stream(response: requests.Response, path: Path) -> None:
-    """Stream response body to a file."""
-    with open(path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=65536):
-            if chunk:
-                f.write(chunk)
 
 
 # ── Main Google Drive entry point ────────────────────────────────────
@@ -361,35 +520,34 @@ def _write_stream(response: requests.Response, path: Path) -> None:
 def download_google_drive(url: str, out_dir: Path, cookie_jar=None) -> None:
     """
     Robust Google Drive downloader.
-    
+
     For folders:
-      1. Enumerate all files in the folder (scrape + fallback to gdown internals)
-      2. Download each file individually with retries
-      3. Never let one failure stop the rest
-    
+      1. Enumerate ALL files via Drive API v3 (with pagination + recursion)
+      2. Fall back to HTML scrape if no API key
+      3. Download each file individually with retries
+      4. Never let one failure stop the rest
+
     For single files:
       Uses the same per-file retry logic.
     """
     parsed = urlparse.urlparse(url)
     path = parsed.path or ""
-
     session = get_session(cookie_jar)
+    api_key = load_api_key()
+
     print(f"[gdrive] Processing: {url}")
 
     # ── Single file ──
     if "/folders/" not in path and "/drive/folders/" not in path:
-        # Extract file ID
         m = re.search(r'/d/([a-zA-Z0-9_-]+)', path)
         if m:
             file_id = m.group(1)
         else:
             qs = dict(urlparse.parse_qsl(parsed.query))
             file_id = qs.get("id", "")
-
         if not file_id:
             print(f"[gdrive] Could not extract file ID from {url}")
             return
-
         download_gdrive_file(file_id, file_id, out_dir, session)
         return
 
@@ -399,58 +557,89 @@ def download_google_drive(url: str, out_dir: Path, cookie_jar=None) -> None:
         print(f"[gdrive] Could not extract folder ID from {url}")
         return
 
-    # First, try gdown for the whole folder (it handles subfolder
-    # structure nicely). If it succeeds fully, great.
-    if gdown is not None:
-        try:
-            print("[gdrive] Attempting full gdown folder download first...")
-            gdown.download_folder(
-                url=url,
-                output=str(out_dir),
-                quiet=False,
-                use_cookies=True,
-                remaining_ok=True,
-                resume=True,
-            )
-            print("[gdrive] gdown folder download completed successfully.")
-            return
-        except (FileURLRetrievalError, FolderContentsMaximumLimitError, json.JSONDecodeError) as e:
-            print(f"[gdrive] gdown folder download hit error: {e}")
-            print("[gdrive] Falling back to per-file enumeration + download...")
-        except Exception as e:
-            print(f"[gdrive] gdown unexpected error: {e}")
-            print("[gdrive] Falling back to per-file enumeration + download...")
+    # Enumerate files
+    files = []
+    if api_key:
+        print(f"[gdrive] Using Drive API v3 to enumerate folder (full pagination)...")
+        files = enumerate_folder_recursive(folder_id, api_key, session)
+    else:
+        print("[gdrive] ┌─────────────────────────────────────────────────────────┐")
+        print("[gdrive] │ No API key found. Large folders will be INCOMPLETE.     │")
+        print("[gdrive] │ Run: python downloader.py --setup-key                   │")
+        print("[gdrive] │ Or set GDRIVE_API_KEY=... in your environment.          │")
+        print("[gdrive] └─────────────────────────────────────────────────────────┘")
 
-    # Enumerate files in the folder
-    files = enumerate_folder_files(url, session)
+    # If API enumeration returned nothing, try gdown first, then HTML scrape
+    if not files:
+        if gdown is not None:
+            try:
+                print("[gdrive] Trying gdown for folder download...")
+                gdown.download_folder(
+                    url=url,
+                    output=str(out_dir),
+                    quiet=False,
+                    use_cookies=True,
+                    remaining_ok=True,
+                    resume=True,
+                )
+                print("[gdrive] gdown folder download completed.")
+                return
+            except Exception as e:
+                print(f"[gdrive] gdown folder download failed: {e}")
+
+        print("[gdrive] Falling back to HTML scrape (will be incomplete for large folders)...")
+        files = enumerate_folder_html_scrape(url, session)
+
     if not files:
         reason = "Could not enumerate any files in folder"
         print(f"[gdrive] {reason}")
         log_failed_google_download(url, out_dir, reason)
         return
 
-    print(f"[gdrive] Downloading {len(files)} files individually...")
+    # Download all files
+    total = len(files)
+    print(f"\n[gdrive] ═══ Downloading {total} files ═══\n")
+
     success = 0
+    skipped = 0
     failed = 0
+    start_time = time.time()
+
     for i, finfo in enumerate(files, 1):
         fid = finfo["id"]
-        fname = finfo["name"]
-        print(f"\n[gdrive] [{i}/{len(files)}] {fname}")
+        rel_path = finfo["rel_path"]
 
-        ok = download_gdrive_file(fid, fname, out_dir, session)
+        # Check if already downloaded
+        target = out_dir / rel_path
+        if target.exists() and target.stat().st_size > 0:
+            skipped += 1
+            if i % 50 == 0:
+                print(f"  [{i}/{total}] (skipping already-downloaded files...)")
+            continue
+
+        print(f"  [{i}/{total}] {rel_path}")
+        ok = download_gdrive_file(fid, rel_path, out_dir, session)
         if ok:
             success += 1
         else:
             failed += 1
 
-        # Small polite delay between files to avoid triggering rate limits
-        if i < len(files):
-            time.sleep(1.5)
+        # Polite delay to avoid rate limiting (smaller for small files)
+        if i < total:
+            time.sleep(0.8)
 
-    print(f"\n[gdrive] Folder done: {success} succeeded, {failed} failed out of {len(files)}")
+    elapsed = time.time() - start_time
+    print(f"\n[gdrive] ═══ Folder complete ═══")
+    print(f"[gdrive]   Total files:  {total}")
+    print(f"[gdrive]   Downloaded:   {success}")
+    print(f"[gdrive]   Skipped:      {skipped}")
+    print(f"[gdrive]   Failed:       {failed}")
+    print(f"[gdrive]   Elapsed:      {elapsed:.1f}s")
+    if failed > 0:
+        print(f"[gdrive]   See {FAILED_LOG} for details on failures.")
 
 
-# ── Dropbox (unchanged) ──────────────────────────────────────────────
+# ── Dropbox ──────────────────────────────────────────────────────────
 
 def download_dropbox_file(url: str, out_dir: Path) -> None:
     parsed = urlparse.urlparse(url)
@@ -473,7 +662,7 @@ def download_dropbox_file(url: str, out_dir: Path) -> None:
         _write_stream(r, local_path)
 
 
-# ── Generic file + page scraping (unchanged) ─────────────────────────
+# ── Generic + page scraping ──────────────────────────────────────────
 
 def make_local_path_for_generic(url: str, base_dir: Path) -> Path:
     parsed = urlparse.urlparse(url)
@@ -513,8 +702,6 @@ def looks_like_direct_file(url: str) -> bool:
 
 def process_url(url: str) -> None:
     data_dir = ensure_data_dir()
-
-    # Set up browser cookies before anything else
     cookie_jar = setup_cookies()
 
     if is_google_drive_url(url):
@@ -550,8 +737,13 @@ def process_url(url: str) -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--setup-key":
+        setup_key_interactive()
+        sys.exit(0)
+
     if len(sys.argv) != 2:
         print("Usage: python downloader.py <url>")
+        print("       python downloader.py --setup-key")
         sys.exit(1)
 
     process_url(sys.argv[1])
